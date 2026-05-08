@@ -89,7 +89,7 @@ def calculate_cosine_similarity(vec1: list[float], vec2: list[float]) -> float:
 def get_w2v_model():
     """
     Получает или инициализирует модель Word2Vec.
-    Использует предобученные многоязычные векторы Google News (300 dim).
+    Использует предобученные векторы Russian National Corpus (300 dim).
 
     Returns:
         Модель KeyedVectors или None если недоступна
@@ -100,16 +100,14 @@ def get_w2v_model():
 
     if _w2v_model is None:
         try:
-            # Пытаемся загрузить предобученные векторы
-            # Для продакшена рекомендуется скачать модель заранее:
-            # python -m gensim.downloader load 'word2vec-google-news-300'
-            logger.info("Загрузка модели Word2Vec (это может занять время при первом запуске)...")
+            # Загружаем русскую модель word2vec-ruscorpora-300
+            logger.info("Загрузка модели Word2Vec (word2vec-ruscorpora-300)...")
             import gensim.downloader as api
-            _w2v_model = api.load('word2vec-google-news-300')
-            logger.info("Модель Word2Vec успешно загружена")
+            _w2v_model = api.load('word2vec-ruscorpora-300')
+            logger.info(f"Модель Word2Vec успешно загружена: {_w2v_model.vector_size} dim, {len(_w2v_model)} слов")
         except Exception as e:
-            logger.warning(f"Не удалось загрузить модель Word2Vec: {e}. Используется эвристика.")
-            _w2v_model = None
+            logger.error(f"Не удалось загрузить модель Word2Vec: {e}")
+            raise RuntimeError(f"Критическая ошибка: не удалось загрузить модель word2vec-ruscorpora-300: {e}")
 
     return _w2v_model
 
@@ -120,9 +118,9 @@ def get_embedding(text: str) -> list[float]:
 
     Метод:
     1. Текст токенизируется на слова
-    2. Для каждого слова ищется вектор в модели Word2Vec
+    2. Для каждого слова ищется вектор в модели Word2Vec (ruscorpora-300)
     3. Вектор предложения вычисляется как среднее арифметическое векторов слов
-    4. Если модель недоступна, используется эвристика на основе символов
+    4. Если слово не найдено, используем его лемму (через pymorphy3)
 
     Args:
         text: текст для получения эмбеддинга
@@ -130,60 +128,64 @@ def get_embedding(text: str) -> list[float]:
     Returns:
         вектор представления текста
     """
-    # Попытка использовать модель Word2Vec
     model = get_w2v_model()
-    if model is not None:
-        try:
-            # Токенизация: приводим к нижнему регистру и разбиваем на слова
-            words = text.lower().split()
 
-            # Получаем векторы для известных слов
-            vectors = []
-            for word in words:
-                # Очищаем слово от пунктуации
-                clean_word = re.sub(r'[^\w]', '', word)
-                if clean_word and clean_word in model:
-                    vectors.append(model[clean_word])
+    try:
+        # Токенизация: приводим к нижнему регистру и разбиваем на слова
+        words = text.lower().split()
 
-            if vectors:
-                # Усредняем векторы
-                import numpy as np
-                embedding = np.mean(vectors, axis=0)
-                # Нормализация
-                norm = np.linalg.norm(embedding)
-                if norm > 0:
-                    embedding = embedding / norm
-                return embedding.tolist()
-        except Exception as e:
-            logger.warning(f"Ошибка при получении эмбеддинга через Word2Vec: {e}. Используется эвристика.")
+        # Получаем векторы для известных слов
+        vectors = []
+        for word in words:
+            # Очищаем слово от пунктуации
+            clean_word = re.sub(r'[^\w]', '', word)
+            if not clean_word:
+                continue
 
-    # Fallback: простая эвристика на основе символов
-    embedding_dim = 128
-    embedding = [0.0] * embedding_dim
+            # Прямой поиск слова в модели
+            if clean_word in model:
+                vectors.append(model[clean_word])
+            else:
+                # Пытаемся найти лемму слова через pymorphy3
+                try:
+                    import pymorphy3
+                    morph = pymorphy3.MorphAnalyzer()
+                    parsed = morph.parse(clean_word)[0]
+                    lemma = parsed.normal_form
+                    if lemma in model:
+                        vectors.append(model[lemma])
+                except Exception:
+                    pass  # Если лемматизация не удалась, пропускаем слово
 
-    for i, char in enumerate(text):
-        idx = ord(char) % embedding_dim
-        embedding[idx] += 1.0
+        if vectors:
+            # Усредняем векторы
+            import numpy as np
+            embedding = np.mean(vectors, axis=0)
+            # Нормализация
+            norm = np.linalg.norm(embedding)
+            if norm > 0:
+                embedding = embedding / norm
+            return embedding.tolist()
 
-    # Нормализация
-    norm = sum(e * e for e in embedding) ** 0.5
-    if norm > 0:
-        embedding = [e / norm for e in embedding]
+        # Если ни одно слово не найдено, возвращаем нулевой вектор
+        return [0.0] * 300
 
-    return embedding
+    except Exception as e:
+        logger.error(f"Ошибка при получении эмбеддинга через Word2Vec: {e}")
+        raise RuntimeError(f"Критическая ошибка при вычислении эмбеддинга: {e}")
 
 
 def evaluate_semantic_similarity(original_text: str, translated_text: str, back_translated_text: Optional[str] = None) -> dict:
     """
-    Оценка семантической близости через косинусное сходство векторов.
-
-    ИСПРАВЛЕННАЯ ВЕРСИЯ с использованием обратного перевода:
-    1. Если есть обратный перевод (back_translated_text), сравниваем original_text с ним
-       (оба на русском языке → векторы сопоставимы)
-    2. Если обратного перевода нет - используем эвристику на основе длины и структуры
+    Оценка семантической близости через косинусное сходство векторов Word2Vec.
 
     Метод:
-    1. Оба текста кодируются в векторное пространство Word2Vec
+    1. Если есть обратный перевод (back_translated_text), сравниваем original_text с ним
+       (оба на русском языке → векторы сопоставимы в пространстве ruscorpora-300)
+    2. Если обратного перевода нет - используем прямой перевод (менее точно)
+
+    Метод:
+    1. Оба текста кодируются в векторное пространство Word2Vec (ruscorpora-300)
     2. Вычисляется косинус угла между ними
     3. Формула: similarity = cos(θ) = (A · B) / (||A|| * ||B||)
 
@@ -208,9 +210,11 @@ def evaluate_semantic_similarity(original_text: str, translated_text: str, back_
         back_trans_embedding = get_embedding(back_translated_text)
         cosine_sim = calculate_cosine_similarity(orig_embedding, back_trans_embedding)
     else:
-        # Fallback: эвристический метод без нейросетей
-        logger.info("Обратный перевод недоступен, используем эвристику")
-        cosine_sim = _heuristic_similarity(original_text, translated_text)
+        # Без обратного перевода сравниваем напрямую (менее точно)
+        logger.info("Обратный перевод недоступен, используем прямое сравнение через Word2Vec")
+        orig_embedding = get_embedding(original_text)
+        trans_embedding = get_embedding(translated_text)
+        cosine_sim = calculate_cosine_similarity(orig_embedding, trans_embedding)
 
     # Порог 0.7 для определения хорошего перевода
     threshold = 0.7
@@ -221,97 +225,11 @@ def evaluate_semantic_similarity(original_text: str, translated_text: str, back_
         "is_good": is_good,
         "threshold": threshold,
         "quality_score": round(cosine_sim * 100, 2),  # Конвертируем в проценты 0-100
-        "method": "Semantic Similarity (Round-trip + Word2Vec)" if back_translated_text else "Semantic Similarity (Heuristic)",
+        "method": "Semantic Similarity (Round-trip + Word2Vec ruscorpora-300)" if back_translated_text else "Semantic Similarity (Word2Vec ruscorpora-300)",
         "details": {
             "original_preview": original_text[:100] + ("..." if len(original_text) > 100 else ""),
             "translated_preview": translated_text[:100] + ("..." if len(translated_text) > 100 else ""),
             "back_translated_preview": (back_translated_text[:100] + ("..." if len(back_translated_text) > 100 else "")) if back_translated_text else None
-        }
-    }
-
-    # Логирование результатов
-    log_semantic_similarity(result)
-
-    return result
-
-
-def _heuristic_perplexity(text: str) -> float:
-    """Эвристическая оценка перплексии без нейросетей"""
-    if not text or len(text.strip()) == 0:
-        return 100.0
-
-    words = text.lower().split()
-    n = len(words)
-
-    if n == 0:
-        return 100.0
-
-    # Подсчёт частоты слов
-    word_freq = {}
-    for word in words:
-        word_freq[word] = word_freq.get(word, 0) + 1
-
-    # Расчёт средней вероятности слов
-    total_log_prob = 0.0
-    for word in words:
-        prob = word_freq[word] / n
-        if prob > 0:
-            total_log_prob += math.log(prob)
-
-    avg_log_prob = total_log_prob / n
-    perplexity = math.exp(-avg_log_prob)
-
-    # Штраф за неестественные паттерны
-    repeats = sum(1 for i in range(len(words)-1) if words[i] == words[i+1])
-    perplexity *= (1 + repeats * 0.5)
-
-    # Слишком короткие/длинные слова
-    avg_len = sum(len(w) for w in words) / n
-    if avg_len < 3 or avg_len > 12:
-        perplexity *= 1.3
-
-    return round(perplexity, 4)
-
-
-def _heuristic_similarity(orig: str, trans: str) -> float:
-    """Эвристическая оценка сходства без нейросетей"""
-    orig_len = len(orig.split())
-    trans_len = len(trans.split())
-
-    if orig_len == 0 or trans_len == 0:
-        return 0.0
-
-    # Соотношение длин
-    length_ratio = min(orig_len, trans_len) / max(orig_len, trans_len)
-    score = length_ratio * 0.7
-
-    # Числа
-    orig_nums = len(re.findall(r'\d+', orig))
-    trans_nums = len(re.findall(r'\d+', trans))
-    if orig_nums == trans_nums and orig_nums > 0:
-        score += 0.15
-
-    # Пунктуация
-    orig_punct = len(re.findall(r'[,.!?;:]', orig))
-    trans_punct = len(re.findall(r'[,.!?;:]', trans))
-    if abs(orig_punct - trans_punct) <= 1:
-        score += 0.15
-
-    return min(1.0, score)
-
-    # Порог 0.7 для определения хорошего перевода
-    threshold = 0.7
-    is_good = cosine_sim >= threshold
-
-    result = {
-        "cosine_similarity": round(cosine_sim, 4),
-        "is_good": is_good,
-        "threshold": threshold,
-        "quality_score": round(cosine_sim * 100, 2),  # Конвертируем в проценты 0-100
-        "method": "Semantic Similarity (Multilingual LaBSE)",
-        "details": {
-            "original_preview": original_text[:100] + ("..." if len(original_text) > 100 else ""),
-            "translated_preview": translated_text[:100] + ("..." if len(translated_text) > 100 else "")
         }
     }
 
@@ -405,9 +323,41 @@ def evaluate_cross_entropy(original_text: str, translated_text: str) -> dict:
         - is_natural: булево значение (насколько естественен перевод)
         - quality_score: оценка качества (0-100)
     """
-    # Используем эвристический метод для оценки перплексии (LM требуют много памяти)
-    translated_perplexity = _heuristic_perplexity(translated_text)
-    original_perplexity = calculate_perplexity(original_text)
+    # Используем Word2Vec для оценки естественности через семантическую связность
+    # Вычисляем перплексию на основе векторных расстояний между соседними словами
+    try:
+        model = get_w2v_model()
+
+        def w2v_perplexity(text: str) -> float:
+            words = text.lower().split()
+            if len(words) < 2:
+                return 1.0
+
+            vectors = []
+            for word in words:
+                clean_word = re.sub(r'[^\w]', '', word)
+                if clean_word in model:
+                    vectors.append(model[clean_word])
+
+            if len(vectors) < 2:
+                return 50.0  # Высокая перплексия если мало известных слов
+
+            # Вычисляем среднее расстояние между соседними векторами
+            total_distance = 0.0
+            for i in range(len(vectors) - 1):
+                dist = np.linalg.norm(vectors[i] - vectors[i+1])
+                total_distance += dist
+
+            avg_distance = total_distance / (len(vectors) - 1)
+            # Нормализуем: среднее расстояние ~0.5-1.5 для связного текста
+            perplexity = avg_distance * 10
+            return min(100.0, perplexity)
+
+        translated_perplexity = w2v_perplexity(translated_text)
+        original_perplexity = w2v_perplexity(original_text)
+    except Exception as e:
+        logger.error(f"Критическая ошибка при вычислении перплексии через Word2Vec: {e}")
+        raise RuntimeError(f"Не удалось вычислить перплексию: {e}")
 
     # Отношение перплексий (должно быть близко к 1)
     if original_perplexity > 0 and original_perplexity != float('inf'):
