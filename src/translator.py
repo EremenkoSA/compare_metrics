@@ -1,7 +1,7 @@
 from PySide6.QtCore import QObject
 from src.core.event_bus import get_event_bus
 from src.ui.overlay_display import TranslationOverlay
-from src.translation.quality_assessment import evaluate_comprehensive_quality
+from src.quality_assessment import evaluate_comprehensive_quality
 import requests
 import json
 import logging

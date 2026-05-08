@@ -79,6 +79,12 @@ class ComparisonResult:
     reference_preview: str
     candidate_preview: str
 
+    # Полные тексты для анализа
+    source_full: str = ""
+    reference_full: str = ""
+    candidate_full: str = ""
+    back_translated_full: str = ""
+
     # Метрики по эталону
     ref_bleu: float = 0.0
     ref_meteor: float = 0.0
@@ -89,6 +95,7 @@ class ComparisonResult:
     my_semantic: float = 0.0
     my_cross_entropy: float = 0.0
     my_ner: float = 0.0
+    my_roundtrip: float = 0.0
     my_overall: float = 0.0
 
     # Разница
@@ -398,7 +405,8 @@ def evaluate_reference_based(pair: TranslationPair) -> ReferenceBasedMetrics:
 
     # COMET (эвристика на основе semantic similarity)
     # В реальной реализации нужно использовать pretrained COMET модель
-    sem_result = evaluate_semantic_similarity(pair.reference, pair.candidate)
+    # Для reference-based оценки используем прямое сравнение reference и candidate
+    sem_result = evaluate_semantic_similarity(pair.reference, pair.candidate, back_translated_text=None)
     if sem_result and "cosine_similarity" in sem_result:
         metrics.comet = round(sem_result["cosine_similarity"] * 100, 2)
     else:
@@ -428,6 +436,11 @@ def evaluate_reference_free(pair: TranslationPair, back_translated_text: Optiona
     """
     metrics = ReferenceFreeMetrics()
 
+    # Логирование для отладки
+    logger.info(f"[RefFree DEBUG] Source: {pair.source[:100]}...")
+    logger.info(f"[RefFree DEBUG] Candidate: {pair.candidate[:100]}...")
+    logger.info(f"[RefFree DEBUG] Back-translated: {back_translated_text[:100] if back_translated_text else 'None'}...")
+
     # Semantic Similarity между source и candidate с использованием обратного перевода
     sem_result = evaluate_semantic_similarity(
         pair.source,
@@ -439,6 +452,8 @@ def evaluate_reference_free(pair: TranslationPair, back_translated_text: Optiona
     else:
         metrics.semantic_similarity = 50.0
 
+    logger.info(f"[RefFree DEBUG] Semantic score: {metrics.semantic_similarity}")
+
     # Cross-Entropy Quality
     ce_result = evaluate_cross_entropy(pair.source, pair.candidate)
     if ce_result and "quality_score" in ce_result:
@@ -446,31 +461,53 @@ def evaluate_reference_free(pair: TranslationPair, back_translated_text: Optiona
     else:
         metrics.cross_entropy_quality = 50.0
 
+    logger.info(f"[RefFree DEBUG] Cross-entropy score: {metrics.cross_entropy_quality}")
+
     # NER Consistency
     ner_result = evaluate_ner_consistency(pair.source, pair.candidate)
     metrics.ner_consistency = round(ner_result["quality_score"], 2)
 
-    # Round-trip Consistency (если есть обратный перевод)
+    logger.info(f"[RefFree DEBUG] NER score: {metrics.ner_consistency}")
+
+    # Round-trip Consistency (если есть обратный перевод) - ВАЖНО: основной метод оценки
     if back_translated_text:
         rt_result = evaluate_roundtrip_consistency(pair.source, pair.candidate, back_translated_text)
         if rt_result and "quality_score" in rt_result:
             metrics.roundtrip_consistency = round(rt_result["quality_score"] * 100, 2)
         else:
             metrics.roundtrip_consistency = 50.0
+        logger.info(f"[RefFree DEBUG] Roundtrip score: {metrics.roundtrip_consistency}")
     else:
         metrics.roundtrip_consistency = 0.0  # Не вычислялось
+        logger.warning("[RefFree DEBUG] Нет back_translated_text, roundtrip = 0")
 
     # Общий score (средневзвешенный) - нормализуем к 0-100
-    weights = {"semantic": 0.4, "cross_entropy": 0.3, "ner": 0.2, "roundtrip": 0.1}
-    metrics.overall_score = round(
-        weights["semantic"] * metrics.semantic_similarity +
-        weights["cross_entropy"] * metrics.cross_entropy_quality +
-        weights["ner"] * metrics.ner_consistency +
-        weights["roundtrip"] * metrics.roundtrip_consistency,
-        2
-    )
+    # Увеличиваем вес roundtrip и semantic как наиболее коррелирующих с человеческой оценкой
+    weights = {"semantic": 0.35, "cross_entropy": 0.20, "ner": 0.15, "roundtrip": 0.30}
+
+    # Если есть roundtrip, используем его, иначе перераспределяем веса
+    if metrics.roundtrip_consistency > 0:
+        metrics.overall_score = round(
+            weights["semantic"] * metrics.semantic_similarity +
+            weights["cross_entropy"] * metrics.cross_entropy_quality +
+            weights["ner"] * metrics.ner_consistency +
+            weights["roundtrip"] * metrics.roundtrip_consistency,
+            2
+        )
+    else:
+        # Без roundtrip увеличиваем веса остальных метрик
+        adjusted_weights = {"semantic": 0.45, "cross_entropy": 0.25, "ner": 0.20, "roundtrip": 0.10}
+        metrics.overall_score = round(
+            adjusted_weights["semantic"] * metrics.semantic_similarity +
+            adjusted_weights["cross_entropy"] * metrics.cross_entropy_quality +
+            adjusted_weights["ner"] * metrics.ner_consistency,
+            2
+        )
+
     # Ограничиваем диапазон 0-100
     metrics.overall_score = min(100.0, max(0.0, metrics.overall_score))
+
+    logger.info(f"[RefFree DEBUG] Overall score: {metrics.overall_score}")
 
     return metrics
 
@@ -547,6 +584,10 @@ def process_dataset(
                 # Обратный перевод EN -> RU для round-trip проверки
                 back_translated = lm_client.translate(pair.candidate, "en", "ru")
                 logger.info(f"  Обратный перевод получен: {back_translated is not None}")
+                if back_translated:
+                    logger.info(f"  [DEBUG] Candidate (EN): {pair.candidate[:150]}...")
+                    logger.info(f"  [DEBUG] Back-translated (RU): {back_translated[:150]}...")
+                    logger.info(f"  [DEBUG] Original (RU): {pair.source[:150]}...")
             else:
                 logger.warning(f"Не удалось получить перевод для пары {idx}, используем reference как candidate")
                 pair.candidate = pair.reference
@@ -554,6 +595,12 @@ def process_dataset(
             # Для тестирования используем reference как candidate
             # В реальности здесь должен быть перевод от вашей модели
             pair.candidate = pair.reference
+            logger.info(f"  [INFO] Используем reference как candidate (тестовый режим)")
+            # При использовании reference как candidate, back_translated будет source
+            # Это даёт идеальную round-trip проверку для тестирования
+            if not back_translated:
+                back_translated = pair.source
+                logger.info(f"  [DEBUG] Back-translated установлен в original source для тестирования")
 
         # Оцениваем по эталону
         ref_metrics = evaluate_reference_based(pair)
@@ -570,6 +617,10 @@ def process_dataset(
             source_preview=pair.source[:100] + ("..." if len(pair.source) > 100 else ""),
             reference_preview=pair.reference[:100] + ("..." if len(pair.reference) > 100 else ""),
             candidate_preview=pair.candidate[:100] + ("..." if len(pair.candidate) > 100 else ""),
+            source_full=pair.source,
+            reference_full=pair.reference,
+            candidate_full=pair.candidate,
+            back_translated_full=back_translated or "",
             ref_bleu=ref_metrics.bleu,
             ref_meteor=ref_metrics.meteor,
             ref_chrf=ref_metrics.chrf,
@@ -577,6 +628,7 @@ def process_dataset(
             my_semantic=my_metrics.semantic_similarity,
             my_cross_entropy=my_metrics.cross_entropy_quality,
             my_ner=my_metrics.ner_consistency,
+            my_roundtrip=my_metrics.roundtrip_consistency,
             my_overall=my_metrics.overall_score,
             difference=diff,
             correlation_marker=marker
