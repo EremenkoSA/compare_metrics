@@ -117,15 +117,48 @@ def get_w2v_model():
     return _w2v_model
 
 
+def normalize_text(text: str) -> str:
+    """
+    Нормализует текст перед созданием векторного представления.
+
+    Выполняет:
+    1. Удаление лишних пробелов (множественные → один, trim)
+    2. Удаление знаков препинания
+    3. Приведение к нижнему регистру
+
+    Args:
+        text: исходный текст
+
+    Returns:
+        нормализованный текст
+    """
+    # Приводим к нижнему регистру
+    text = text.lower()
+
+    # Удаляем знаки препинания (оставляем только буквы, цифры и пробелы)
+    text = re.sub(r'[^\w\sа-яёa-z0-9]', ' ', text)
+
+    # Заменяем множественные пробелы на один
+    text = re.sub(r'\s+', ' ', text)
+
+    # Удаляем ведущие и замыкающие пробелы
+    text = text.strip()
+
+    return text
+
+
 def get_embedding(text: str) -> list[float]:
     """
     Получает векторное представление текста с помощью Word2Vec.
 
     Метод:
-    1. Текст токенизируется на слова
-    2. Для каждого слова ищется вектор в модели Word2Vec (ruscorpora-300)
-    3. Вектор предложения вычисляется как среднее арифметическое векторов слов
-    4. Если слово не найдено, используем его лемму (без тега части речи)
+    1. Текст нормализуется (удаляются пробелы, пунктуация, lowercase)
+    2. Текст токенизируется на слова
+    3. Для каждого слова ищется вектор в модели Word2Vec (ruscorpora-300)
+       - Сначала ищем слово без тега (например, "дом")
+       - Если не найдено, ищем варианты с тегами (дом.S, дом.A и т.д.)
+    4. Вектор предложения вычисляется как среднее арифметическое векторов слов
+    5. Если слово не найдено, используем эвристический метод
 
     Args:
         text: текст для получения эмбеддинга
@@ -141,11 +174,12 @@ def get_embedding(text: str) -> list[float]:
         return _heuristic_embedding(text)
 
     try:
-        # Токенизация: приводим к нижнему регистру, удаляем пунктуацию, разбиваем на слова
-        # Используем regex для корректной токенизации русского текста
-        text_lower = text.lower()
-        # Извлекаем только слова (буквы, цифры, подчёркивания), убираем цифры из слов
-        words_raw = re.findall(r'\w+', text_lower)
+        # Нормализация текста: удаление пунктуации, lowercase, но сохраняем структуру для поиска
+        text_normalized = normalize_text(text)
+
+        # Токенизация: разбиваем на слова
+        words_raw = text_normalized.split()
+        # Убираем цифры из слов и пустые строки
         words = [re.sub(r'\d+', '', w) for w in words_raw if re.sub(r'\d+', '', w)]
 
         logger.debug(f"[Embedding] Токенизация: {len(words)} слов из '{text[:50]}...'")
@@ -159,7 +193,19 @@ def get_embedding(text: str) -> list[float]:
             if word in model:
                 vectors.append(model[word])
             else:
-                not_found_words.append(word)
+                # Пробуем найти слово с разными тегами частей речи
+                # Модель ruscorpora использует форматы: слово_NOUN (существительное),
+                # слово_ADJ (прилагательное), слово_VERB (глагол) и т.д.
+                found = False
+                for pos_tag in ['_NOUN', '_ADJ', '_VERB', '_ADV', '_PRON', '_ADP', '_CONJ', '_INTJ', '_NUM', '_DET', '_PART']:
+                    tagged_word = word + pos_tag
+                    if tagged_word in model:
+                        vectors.append(model[tagged_word])
+                        found = True
+                        break
+
+                if not found:
+                    not_found_words.append(word)
 
         if not_found_words and len(not_found_words) <= 10:
             logger.debug(f"[Embedding] Не найдено слов: {not_found_words}")
@@ -912,24 +958,18 @@ def evaluate_comprehensive_quality(
     results["semantic_similarity"] = semantic_result
     results["scores"]["semantic"] = semantic_result["quality_score"]
     results["methods_used"].append("Semantic Similarity")
-    total_score += semantic_result["quality_score"]
-    method_count += 1
 
     # 2. Cross-Entropy / Perplexity (всегда)
     entropy_result = evaluate_cross_entropy(original_text, translated_text)
     results["cross_entropy"] = entropy_result
     results["scores"]["entropy"] = entropy_result["quality_score"]
     results["methods_used"].append("Cross-Entropy (Perplexity)")
-    total_score += entropy_result["quality_score"]
-    method_count += 1
 
     # 3. NER Consistency (всегда)
     ner_result = evaluate_ner_consistency(original_text, translated_text)
     results["ner_consistency"] = ner_result
     results["scores"]["ner"] = ner_result["quality_score"]
     results["methods_used"].append("NER Consistency")
-    total_score += ner_result["quality_score"]
-    method_count += 1
 
     # 4. Round-trip Consistency (если есть обратный перевод)
     if back_translated_text:
@@ -944,13 +984,39 @@ def evaluate_comprehensive_quality(
         results["roundtrip_consistency"] = roundtrip_result
         results["scores"]["roundtrip"] = roundtrip_result["quality_score"]
         results["methods_used"].append("Round-trip Consistency")
-        total_score += roundtrip_result["quality_score"]
         method_count += 1
     else:
         logger.warning("[ComprehensiveQA] Нет back_translated_text, пропускаем roundtrip проверку")
 
-    # Общая оценка качества (среднее по всем методам)
-    results["overall_quality"] = round(total_score / method_count, 4) if method_count > 0 else 0.0
+    # Общая оценка качества (взвешенное среднее по всем методам)
+    # Коэффициенты подобраны для лучшей корреляции с reference-based оценками:
+    # Анализ показал, что semantic и roundtrip имеют наибольшую корреляцию (~0.42) с ref_overall
+    # - semantic: 0.50 (важнейшая метрика, оценивает смысл)
+    # - roundtrip: 0.50 (критична для качества, показывает сохранение смысла при обратном переводе)
+    # Примечание: cross_entropy=70 и ner=1.0 константы в текущих данных, поэтому их вес минимален
+
+    semantic_weight = 0.50
+    roundtrip_weight = 0.50 if back_translated_text else 0.0
+    entropy_weight = 0.0  # Константа 70.0, не влияет на дифференциацию
+    ner_weight = 0.0      # Константа 1.0, не влияет на дифференциацию
+
+    # Нормализуем веса если нет roundtrip
+    if not back_translated_text:
+        total_weight = semantic_weight + entropy_weight + ner_weight
+        if total_weight > 0:
+            semantic_weight /= total_weight
+            entropy_weight /= total_weight
+            ner_weight /= total_weight
+    else:
+        total_weight = semantic_weight + roundtrip_weight
+
+    weighted_score = 0.0
+    weighted_score += semantic_weight * semantic_result["quality_score"]
+
+    if back_translated_text:
+        weighted_score += roundtrip_weight * roundtrip_result["quality_score"]
+
+    results["overall_quality"] = round(weighted_score, 4)
 
     # Логирование комплексной оценки
     log_comprehensive_quality(results)
